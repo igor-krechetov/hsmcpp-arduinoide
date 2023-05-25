@@ -16,10 +16,13 @@
 #endif
 
 #ifdef HSMBUILD_DEBUGGING
+  #include <array>
   #include <chrono>
   #include <cstdlib>
   #include <cstring>
-  #include <array>
+
+  #include "hsmcpp/os/Mutex.hpp"
+  #include "hsmcpp/os/CriticalSection.hpp"
 
 // WIN, access
   #ifdef WIN32
@@ -27,7 +30,7 @@
     #define F_OK 0
   #else
     #include <unistd.h>
-        // cppcheck-suppress misra-c2012-21.10
+    // cppcheck-suppress misra-c2012-21.10
     #include <ctime>
   #endif
 #endif
@@ -193,20 +196,13 @@ void HierarchicalStateMachine::Impl::registerState(const StateID_t state,
                                                    HsmStateExitCallback_t onExiting) {
 #ifdef HSM_ENABLE_SAFE_STRUCTURE
     if ((false == isSubstate(state)) && (false == isTopState(state))) {
-        mTopLevelStates.push_back(state);
+        mTopLevelStates.emplace_back(state);
     }
 #endif  // HSM_ENABLE_SAFE_STRUCTURE
 
-    if (onStateChanged || onEntering || onExiting) {
-        StateCallbacks cbState;
-
-        cbState.onStateChanged = std::move(onStateChanged);
-        cbState.onEntering = std::move(onEntering);
-        cbState.onExiting = std::move(onExiting);
-        mRegisteredStates[state] = cbState;
-
-        HSM_TRACE_CALL_DEBUG_ARGS("mRegisteredStates.size=%ld", mRegisteredStates.size());
-    }
+    mRegisteredStates[state] =
+        std::move(StateCallbacks(std::move(onStateChanged), std::move(onEntering), std::move(onExiting)));
+    HSM_TRACE_CALL_DEBUG_ARGS("mRegisteredStates.size=%ld", mRegisteredStates.size());
 }
 
 void HierarchicalStateMachine::Impl::registerFinalState(const StateID_t state,
@@ -214,7 +210,7 @@ void HierarchicalStateMachine::Impl::registerFinalState(const StateID_t state,
                                                         HsmStateChangedCallback_t onStateChanged,
                                                         HsmStateEnterCallback_t onEntering,
                                                         HsmStateExitCallback_t onExiting) {
-    mFinalStates.emplace(state, event);
+    mFinalStates[state] = event;
     registerState(state, std::move(onStateChanged), std::move(onEntering), std::move(onExiting));
 }
 
@@ -224,7 +220,7 @@ void HierarchicalStateMachine::Impl::registerHistory(const StateID_t parent,
                                                      const StateID_t defaultTarget,
                                                      HsmTransitionCallback_t transitionCallback) {
     (void)mHistoryStates.emplace(parent, historyState);
-    mHistoryData.emplace(historyState, HistoryInfo(type, defaultTarget, std::move(transitionCallback)));
+    mHistoryData[historyState] = std::move(HistoryInfo(type, defaultTarget, std::move(transitionCallback)));
 }
 
 bool HierarchicalStateMachine::Impl::registerSubstate(const StateID_t parent, const StateID_t substate) {
@@ -240,7 +236,7 @@ bool HierarchicalStateMachine::Impl::registerSubstateEntryPoint(const StateID_t 
 }
 
 void HierarchicalStateMachine::Impl::registerTimer(const TimerID_t timerID, const EventID_t event) {
-    mTimers.emplace(timerID, event);
+    mTimers[timerID] = event;
 }
 
 bool HierarchicalStateMachine::Impl::registerSubstate(const StateID_t parent,
@@ -399,17 +395,17 @@ bool HierarchicalStateMachine::Impl::isStateActive(const StateID_t state) const 
     return (std::find(mActiveStates.begin(), mActiveStates.end(), state) != mActiveStates.end());
 }
 
-void HierarchicalStateMachine::Impl::transitionWithArgsArray(const EventID_t event, const VariantVector_t& args) {
+void HierarchicalStateMachine::Impl::transitionWithArgsArray(const EventID_t event, VariantVector_t&& args) {
     HSM_TRACE_CALL_DEBUG_ARGS("event=<%s>, args.size=%lu", getEventName(event).c_str(), args.size());
 
-    (void)transitionExWithArgsArray(event, false, false, 0, args);
+    (void)transitionExWithArgsArray(event, false, false, 0, std::move(args));
 }
 
 bool HierarchicalStateMachine::Impl::transitionExWithArgsArray(const EventID_t event,
                                                                const bool clearQueue,
                                                                const bool sync,
                                                                const int timeoutMs,
-                                                               const VariantVector_t& args) {
+                                                               VariantVector_t&& args) {
     HSM_TRACE_CALL_DEBUG_ARGS("event=<%s>, clearQueue=%s, sync=%s, args.size=%lu",
                               getEventName(event).c_str(),
                               BOOL2STR(clearQueue),
@@ -423,8 +419,8 @@ bool HierarchicalStateMachine::Impl::transitionExWithArgsArray(const EventID_t e
     if (dispatcherPtr) {
         PendingEventInfo eventInfo;
 
-        eventInfo.type = event;
-        eventInfo.args = args;
+        eventInfo.id = event;
+        eventInfo.args = std::make_shared<VariantVector_t>(std::move(args));
 
         if (true == sync) {
             eventInfo.initLock();
@@ -437,7 +433,7 @@ bool HierarchicalStateMachine::Impl::transitionExWithArgsArray(const EventID_t e
                 clearPendingEvents();
             }
 
-            mPendingEvents.push_back(eventInfo);
+            mPendingEvents.emplace_back(eventInfo);
         }
 
         HSM_TRACE_DEBUG("transitionEx: emit");
@@ -600,18 +596,18 @@ void HierarchicalStateMachine::Impl::handleStartup() {
         std::list<StateID_t> entryPoints;
 
         (void)onStateEntering(mInitialState, VariantVector_t());
-        mActiveStates.push_back(mInitialState);
+        mActiveStates.emplace_back(mInitialState);
         onStateChanged(mInitialState, VariantVector_t());
 
         if (true == getEntryPoints(mInitialState, INVALID_HSM_EVENT_ID, VariantVector_t(), entryPoints)) {
             PendingEventInfo entryPointTransitionEvent;
 
             entryPointTransitionEvent.transitionType = TransitionBehavior::ENTRYPOINT;
-            entryPointTransitionEvent.type = INVALID_HSM_EVENT_ID;
+            entryPointTransitionEvent.id = INVALID_HSM_EVENT_ID;
 
             {
                 HSM_SYNC_EVENTS_QUEUE();
-                mPendingEvents.push_front(entryPointTransitionEvent);
+                mPendingEvents.emplace_front(std::move(entryPointTransitionEvent));
             }
         }
 
@@ -639,7 +635,7 @@ void HierarchicalStateMachine::Impl::dispatchEvents() {
 
                 {
                     HSM_SYNC_EVENTS_QUEUE();
-                    pendingEvent = mPendingEvents.front();
+                    pendingEvent = std::move(mPendingEvents.front());
                     mPendingEvents.pop_front();
                 }
 
@@ -763,12 +759,13 @@ void HierarchicalStateMachine::Impl::executeStateAction(const StateID_t state, c
                 if (actionInfo.actionArgs.size() > 1U) {
                     transitionArgs.reserve(actionInfo.actionArgs.size() - 1U);
 
+                    // copy arguments except for the first one
                     for (size_t i = 1; i < actionInfo.actionArgs.size(); ++i) {
-                        transitionArgs.push_back(actionInfo.actionArgs[i]);
+                        transitionArgs.emplace_back(actionInfo.actionArgs[i]);
                     }
                 }
 
-                transitionWithArgsArray(static_cast<EventID_t>(actionInfo.actionArgs[0].toInt64()), transitionArgs);
+                transitionWithArgsArray(static_cast<EventID_t>(actionInfo.actionArgs[0].toInt64()), std::move(transitionArgs));
             } else {
                 HSM_TRACE_WARNING("unsupported action <%d>", SC2INT(actionInfo.action));
             }
@@ -793,15 +790,38 @@ bool HierarchicalStateMachine::Impl::getParentState(const StateID_t child, State
 bool HierarchicalStateMachine::Impl::isSubstateOf(const StateID_t parent, const StateID_t child) {
     HSM_TRACE_CALL_DEBUG_ARGS("parent=<%s>, child=<%s>", getStateName(parent).c_str(), getStateName(child).c_str());
     StateID_t curState = child;
+    bool stopSearch = false;
 
-    if (parent != child) {
-        // TODO: can be optimized by checking siblings on each level
+    while ((false == stopSearch) && (parent != curState)) {
+        stopSearch = true;
 
-        do {
-            if (false == getParentState(curState, curState)) {
+        for (auto itParent = mSubstates.begin(); itParent != mSubstates.end(); ++itParent) {
+            if (curState == itParent->second) {
+                // found next parent
+                curState = itParent->first;
+                stopSearch = false;
+
+                if (parent != curState) {
+                    // check left siblings
+                    for (auto itSibling = itParent; (itSibling != mSubstates.begin()) && (itSibling->first == itParent->first); --itSibling) {
+                        if (itSibling->second == parent) {
+                            stopSearch = true;
+                            break;
+                        }
+                    }
+
+                    // check right siblings
+                    for (auto itSibling = itParent; (itSibling != mSubstates.end()) && (itSibling->first == itParent->first); ++itSibling) {
+                        if (itSibling->second == parent) {
+                            stopSearch = true;
+                            break;
+                        }
+                    }
+                }
+
                 break;
             }
-        } while (parent != curState);
+        }
     }
 
     return (parent != child) && (parent == curState);
@@ -816,7 +836,7 @@ bool HierarchicalStateMachine::Impl::hasActiveChildren(const StateID_t parent, c
     bool res = false;
 
     for (const StateID_t& activeStateId : mActiveStates) {
-        if ((true == includeFinal) || (false == isFinalState(activeStateId))) {
+        if ((parent != activeStateId) && (true == includeFinal) || (false == isFinalState(activeStateId))) {
             if (isSubstateOf(parent, activeStateId)) {
                 HSM_TRACE_DEBUG("parent=<%s> has <%s> active",
                                 getStateName(parent).c_str(),
@@ -881,7 +901,7 @@ void HierarchicalStateMachine::Impl::updateHistory(const StateID_t topLevelState
                             // clear previos history items
                             itCurHistory->second.previousActiveStates.clear();
                             // we store pointer to be able to identify if this history state was already cleared or not
-                            upatedHistory.push_back(&(itCurHistory->second.previousActiveStates));
+                            upatedHistory.emplace_back(&(itCurHistory->second.previousActiveStates));
                         }
 
                         if (HistoryType::SHALLOW == itCurHistory->second.type) {
@@ -891,7 +911,7 @@ void HierarchicalStateMachine::Impl::updateHistory(const StateID_t topLevelState
                                 HSM_TRACE_DEBUG("SHALLOW -> store state <%s> in history of parent <%s>",
                                                 getStateName(curState).c_str(),
                                                 getStateName(it->second).c_str());
-                                itCurHistory->second.previousActiveStates.push_back(curState);
+                                itCurHistory->second.previousActiveStates.emplace_back(curState);
                             }
                         } else if (HistoryType::DEEP == itCurHistory->second.type) {
                             if (std::find(itCurHistory->second.previousActiveStates.begin(),
@@ -900,7 +920,7 @@ void HierarchicalStateMachine::Impl::updateHistory(const StateID_t topLevelState
                                 HSM_TRACE_DEBUG("DEEP -> store state <%s> in history of parent <%s>",
                                                 getStateName(activeState).c_str(),
                                                 getStateName(it->second).c_str());
-                                itCurHistory->second.previousActiveStates.push_back(activeState);
+                                itCurHistory->second.previousActiveStates.emplace_back(activeState);
                             }
                         } else {
                             // NOTE: do nothing
@@ -934,7 +954,7 @@ bool HierarchicalStateMachine::Impl::checkTransitionPossibility(const StateID_t 
         HSM_SYNC_EVENTS_QUEUE();
 
         for (auto it = mPendingEvents.begin(); (it != mPendingEvents.end()) && (true == possible); ++it) {
-            nextEvent = it->type;
+            nextEvent = it->id;
             possible = findTransitionTarget(currentState, nextEvent, args, true, possibleTransitions);
 
             if (true == possible) {
@@ -1013,7 +1033,7 @@ bool HierarchicalStateMachine::Impl::findTransitionTarget(const StateID_t fromSt
                             break;
                         }
                     } else {
-                        outTransitions.push_back(it->second);
+                        outTransitions.emplace_back(it->second);
                         wasFound = true;
                     }
                 } while ((false == wasFound) && (parentStates.empty() == false));
@@ -1026,7 +1046,7 @@ bool HierarchicalStateMachine::Impl::findTransitionTarget(const StateID_t fromSt
 }
 
 HsmEventStatus HierarchicalStateMachine::Impl::doTransition(const PendingEventInfo& event) {
-    HSM_TRACE_CALL_DEBUG_ARGS("event=<%s>, transitionType=%d", getEventName(event.type).c_str(), SC2INT(event.transitionType));
+    HSM_TRACE_CALL_DEBUG_ARGS("event=<%s>, transitionType=%d", getEventName(event.id).c_str(), SC2INT(event.transitionType));
     HsmEventStatus res = HsmEventStatus::DONE_FAILED;
     auto activeStatesSnapshot = mActiveStates;
     std::list<StateID_t> acceptedStates;  // list of states that accepted transitions
@@ -1051,7 +1071,7 @@ HsmEventStatus HierarchicalStateMachine::Impl::doTransition(const PendingEventIn
                 switch (singleTransitionResult) {
                     case HsmEventStatus::PENDING:
                         res = singleTransitionResult;
-                        acceptedStates.push_back(*it);
+                        acceptedStates.emplace_back(*it);
                         break;
                     case HsmEventStatus::DONE_OK:
                         logHsmAction(HsmLogAction::IDLE,
@@ -1063,7 +1083,7 @@ HsmEventStatus HierarchicalStateMachine::Impl::doTransition(const PendingEventIn
                         if (HsmEventStatus::PENDING != res) {
                             res = singleTransitionResult;
                         }
-                        acceptedStates.push_back(*it);
+                        acceptedStates.emplace_back(*it);
                         break;
                     case HsmEventStatus::CANCELED:
                     case HsmEventStatus::DONE_FAILED:
@@ -1082,7 +1102,7 @@ HsmEventStatus HierarchicalStateMachine::Impl::doTransition(const PendingEventIn
     }
 
     if (mFailedTransitionCallback && ((HsmEventStatus::DONE_FAILED == res) || (HsmEventStatus::CANCELED == res))) {
-        mFailedTransitionCallback(event.type, event.args);
+        mFailedTransitionCallback(activeStatesSnapshot, event.id, event.getArgs());
     }
 
     HSM_TRACE_CALL_RESULT("%d", SC2INT(res));
@@ -1101,18 +1121,18 @@ HsmEventStatus HierarchicalStateMachine::Impl::processExternalTransition(const P
                                                                            : HsmLogAction::TRANSITION_ENTRYPOINT),
                  curTransition.fromState,
                  curTransition.destinationState,
-                 event.type,
+                 event.id,
                  false,
-                 event.args);
+                 event.getArgs());
 
     // cppcheck-suppress misra-c2012-14.4 : false-positive. std::shared_ptr has a bool() operator
     if (curTransition.onTransition) {
-        curTransition.onTransition(event.args);
+        curTransition.onTransition(event.getArgs());
     }
 
-    if (true == onStateEntering(curTransition.destinationState, event.args)) {
+    if (true == onStateEntering(curTransition.destinationState, event.getArgs())) {
         if (true == replaceActiveState(fromState, curTransition.destinationState)) {
-            onStateChanged(curTransition.destinationState, event.args);
+            onStateChanged(curTransition.destinationState, event.getArgs());
         }
 
         // check if current state is a final state
@@ -1127,7 +1147,7 @@ HsmEventStatus HierarchicalStateMachine::Impl::processExternalTransition(const P
             if (false == event.ignoreEntryPoints) {
                 std::list<StateID_t> entryPoints;
 
-                if (true == getEntryPoints(curTransition.destinationState, event.type, event.args, entryPoints)) {
+                if (true == getEntryPoints(curTransition.destinationState, event.id, event.getArgs(), entryPoints)) {
                     HSM_TRACE_DEBUG("state <%s> has substates with %d entry points (first: <%s>)",
                                     getStateName(curTransition.destinationState).c_str(),
                                     SC2INT(entryPoints.size()),
@@ -1168,12 +1188,12 @@ bool HierarchicalStateMachine::Impl::determineTargetState(const PendingEventInfo
     bool isCorrectTransition = false;
 
     if (TransitionBehavior::REGULAR == event.transitionType) {
-        isCorrectTransition = findTransitionTarget(fromState, event.type, event.args, false, outMatchingTransitions);
+        isCorrectTransition = findTransitionTarget(fromState, event.id, event.getArgs(), false, outMatchingTransitions);
 
         if (false == isCorrectTransition) {
             HSM_TRACE_WARNING("no suitable transition from state <%s> with event <%s>",
                               getStateName(fromState).c_str(),
-                              getEventName(event.type).c_str());
+                              getEventName(event.id).c_str());
         }
     } else if (TransitionBehavior::ENTRYPOINT == event.transitionType) {
         isCorrectTransition = true;
@@ -1196,7 +1216,7 @@ bool HierarchicalStateMachine::Impl::determineTargetState(const PendingEventInfo
         if (true == isCorrectTransition) {
             std::list<StateID_t> entryStates;
 
-            isCorrectTransition = getEntryPoints(fromState, event.type, event.args, entryStates);
+            isCorrectTransition = getEntryPoints(fromState, event.id, event.getArgs(), entryStates);
 
             if (true == isCorrectTransition) {
                 for (const auto& curEntryState : entryStates) {
@@ -1209,7 +1229,7 @@ bool HierarchicalStateMachine::Impl::determineTargetState(const PendingEventInfo
             } else {
                 HSM_TRACE_WARNING("state <%s> doesn't have a suitable entry point (event <%s>)",
                                   getStateName(fromState).c_str(),
-                                  getEventName(event.type).c_str());
+                                  getEventName(event.id).c_str());
             }
         }
     } else if (TransitionBehavior::FORCED == event.transitionType) {
@@ -1236,14 +1256,14 @@ bool HierarchicalStateMachine::Impl::executeSelfTransitions(const PendingEventIn
             logHsmAction(HsmLogAction::TRANSITION,
                          curTransition.fromState,
                          curTransition.destinationState,
-                         event.type,
+                         event.id,
                          false,
-                         event.args);
+                         event.getArgs());
 
             // NOTE: false-positive. std::function has a bool() operator
             // cppcheck-suppress misra-c2012-14.4
             if (curTransition.onTransition) {
-                curTransition.onTransition(event.args);
+                curTransition.onTransition(event.getArgs());
             }
 
             hadSelfTransitions = true;
@@ -1275,7 +1295,7 @@ bool HierarchicalStateMachine::Impl::executeExitTransition(const PendingEventInf
                     isExitAllowed = onStateExiting(*itActiveState);
 
                     if (true == isExitAllowed) {
-                        outExitedStates.push_back(*itActiveState);
+                        outExitedStates.emplace_back(*itActiveState);
                     } else {
                         break;
                     }
@@ -1297,7 +1317,7 @@ bool HierarchicalStateMachine::Impl::executeExitTransition(const PendingEventInf
                     mActiveStates.remove(curState);
                     // to prevent infinite loops we don't allow state to cancel transition
                     (void)onStateEntering(curState, VariantVector_t());
-                    mActiveStates.push_back(curState);
+                    mActiveStates.emplace_back(curState);
                     onStateChanged(curState, VariantVector_t());
                 }
             }
@@ -1399,10 +1419,10 @@ void HierarchicalStateMachine::Impl::transitionToDefaultHistoryState(
 
         if (INVALID_HSM_STATE_ID == defaultTarget) {
             // transition to parent's entry point if there is no default history target
-            historyTargets.push_back(historyParent);
+            historyTargets.emplace_back(historyParent);
         } else {
-            historyTargets.push_back(defaultTarget);
-            historyTargets.push_back(historyParent);
+            historyTargets.emplace_back(defaultTarget);
+            historyTargets.emplace_back(historyParent);
         }
     } else {
         HSM_TRACE_ERROR("parent for history state=<%s> wasnt found", getStateName(destinationState).c_str());
@@ -1451,9 +1471,9 @@ bool HierarchicalStateMachine::Impl::processFinalStateTransition(const PendingEv
                 finalStateEvent.args = event.args;
 
                 if (INVALID_HSM_EVENT_ID != itFinalStateEvent->second) {
-                    finalStateEvent.type = itFinalStateEvent->second;
+                    finalStateEvent.id = itFinalStateEvent->second;
                 } else {
-                    finalStateEvent.type = event.type;
+                    finalStateEvent.id = event.id;
                 }
 
                 {
@@ -1471,7 +1491,7 @@ HsmEventStatus HierarchicalStateMachine::Impl::handleSingleTransition(const Stat
                                                                       const PendingEventInfo& event) {
     HSM_TRACE_CALL_DEBUG_ARGS("fromState=<%s>, event=<%s>, transitionType=%d",
                               getStateName(fromState).c_str(),
-                              getEventName(event.type).c_str(),
+                              getEventName(event.id).c_str(),
                               SC2INT(event.transitionType));
     HsmEventStatus res = HsmEventStatus::DONE_FAILED;
     bool isCorrectTransition = false;
@@ -1511,7 +1531,7 @@ HsmEventStatus HierarchicalStateMachine::Impl::handleSingleTransition(const Stat
 
     if (HsmEventStatus::DONE_FAILED == res) {
         HSM_TRACE_DEBUG("event <%s> in state <%s> was ignored.",
-                        getEventName(event.type).c_str(),
+                        getEventName(event.id).c_str(),
                         getStateName(fromState).c_str());
     }
 
@@ -1554,7 +1574,7 @@ bool HierarchicalStateMachine::Impl::getEntryPoints(const StateID_t state,
             // check transition condition if it was defined
             ((nullptr == it->second.checkCondition) ||
              (it->second.checkCondition(transitionArgs) == it->second.expectedConditionValue))) {
-            outEntryPoints.push_back(it->second.state);
+            outEntryPoints.emplace_back(it->second.state);
         }
     }
 
@@ -1576,7 +1596,7 @@ bool HierarchicalStateMachine::Impl::addActiveState(const StateID_t newState) {
     bool wasAdded = false;
 
     if (false == isStateActive(newState)) {
-        mActiveStates.push_back(newState);
+        mActiveStates.emplace_back(newState);
         wasAdded = true;
     }
 
@@ -1670,6 +1690,9 @@ void HierarchicalStateMachine::Impl::logHsmAction(const HsmLogAction action,
                                                   const VariantVector_t& args) {
 #ifdef HSMBUILD_DEBUGGING
     if (true == mHsmLogFile.is_open()) {
+        static Mutex logMutex;
+        CriticalSection logSync(logMutex);
+
         static const std::map<HsmLogAction, std::string> actionsMap = {
             std::make_pair(HsmLogAction::IDLE, "idle"),
             std::make_pair(HsmLogAction::TRANSITION, "transition"),
@@ -1693,7 +1716,7 @@ void HierarchicalStateMachine::Impl::logHsmAction(const HsmLogAction action,
             tmResult = &timeinfo;
         }
   #else
-        // TODO: function is not thread safe [concurrency-mt-unsafe]
+        // NOTE: function is not thread safe [concurrency-mt-unsafe]
         tmResult = localtime(&tt);
         if (nullptr != tmResult) {
             timeinfo = *tmResult;
